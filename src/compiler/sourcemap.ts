@@ -168,7 +168,7 @@ namespace ts {
                     sourceMapData.sourceMapDecodedMappings[sourceMapData.sourceMapDecodedMappings.length - 1] :
                     defaultLastEncodedSourceMapSpan;
 
-                // TODO: Update lastEncodedNameIndex 
+                // TODO: Update lastEncodedNameIndex
                 // Since we dont support this any more, lets not worry about it right now.
                 // When we start supporting nameIndex, we will get back to this
 
@@ -240,6 +240,8 @@ namespace ts {
                 return;
             }
 
+            const start = performance.mark();
+
             const sourceLinePos = getLineAndCharacterOfPosition(currentSourceFile, pos);
 
             // Convert the location to be one-based.
@@ -279,6 +281,8 @@ namespace ts {
             }
 
             updateLastEncodedAndRecordedSpans();
+
+            performance.measure("Source Map", start);
         }
 
         function getStartPos(range: TextRange) {
