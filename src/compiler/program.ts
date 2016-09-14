@@ -8,11 +8,9 @@ namespace ts {
 
     const emptyArray: any[] = [];
 
-    const defaultTypeRoots = ["node_modules/@types"];
-
-    export function findConfigFile(searchPath: string, fileExists: (fileName: string) => boolean): string {
+    export function findConfigFile(searchPath: string, fileExists: (fileName: string) => boolean, configName = "tsconfig.json"): string {
         while (true) {
-            const fileName = combinePaths(searchPath, "tsconfig.json");
+            const fileName = combinePaths(searchPath, configName);
             if (fileExists(fileName)) {
                 return fileName;
             }
@@ -168,7 +166,7 @@ namespace ts {
 
     const typeReferenceExtensions = [".d.ts"];
 
-    function getEffectiveTypeRoots(options: CompilerOptions, host: ModuleResolutionHost) {
+    export function getEffectiveTypeRoots(options: CompilerOptions, host: { directoryExists?: (directoryName: string) => boolean, getCurrentDirectory?: () => string }): string[] | undefined  {
         if (options.typeRoots) {
             return options.typeRoots;
         }
@@ -181,11 +179,37 @@ namespace ts {
             currentDirectory = host.getCurrentDirectory();
         }
 
-        if (!currentDirectory) {
-            return undefined;
-        }
-        return map(defaultTypeRoots, d => combinePaths(currentDirectory, d));
+        return currentDirectory && getDefaultTypeRoots(currentDirectory, host);
     }
+
+    /**
+     * Returns the path to every node_modules/@types directory from some ancestor directory.
+     * Returns undefined if there are none.
+     */
+    function getDefaultTypeRoots(currentDirectory: string,  host: { directoryExists?: (directoryName: string) => boolean }): string[] | undefined {
+        if (!host.directoryExists) {
+            return [combinePaths(currentDirectory, nodeModulesAtTypes)];
+            // And if it doesn't exist, tough.
+        }
+
+        let typeRoots: string[];
+
+        while (true) {
+            const atTypes = combinePaths(currentDirectory, nodeModulesAtTypes);
+            if (host.directoryExists(atTypes)) {
+                (typeRoots || (typeRoots = [])).push(atTypes);
+            }
+
+            const parent = getDirectoryPath(currentDirectory);
+            if (parent === currentDirectory) {
+                break;
+            }
+            currentDirectory = parent;
+        }
+
+        return typeRoots;
+    }
+    const nodeModulesAtTypes = combinePaths("node_modules", "@types");
 
     /**
      * @param {string | undefined} containingFile - file that contains type reference directive, can be undefined if containing file is unknown.
@@ -661,24 +685,27 @@ namespace ts {
      * @param {boolean} onlyRecordFailures - if true then function won't try to actually load files but instead record all attempts as failures. This flag is necessary
      * in cases when we know upfront that all load attempts will fail (because containing folder does not exists) however we still need to record all failed lookup locations.
      */
-    function loadModuleFromFile(candidate: string, extensions: string[], failedLookupLocation: string[], onlyRecordFailures: boolean, state: ModuleResolutionState): string {
-        // First try to keep/add an extension: importing "./foo.ts" can be matched by a file "./foo.ts", and "./foo" by "./foo.d.ts"
-        const resolvedByAddingOrKeepingExtension = loadModuleFromFileWorker(candidate, extensions, failedLookupLocation, onlyRecordFailures, state);
-        if (resolvedByAddingOrKeepingExtension) {
-            return resolvedByAddingOrKeepingExtension;
+    function loadModuleFromFile(candidate: string, extensions: string[], failedLookupLocation: string[], onlyRecordFailures: boolean, state: ModuleResolutionState): string | undefined {
+        // First, try adding an extension. An import of "foo" could be matched by a file "foo.ts", or "foo.js" by "foo.js.ts"
+        const resolvedByAddingExtension = tryAddingExtensions(candidate, extensions, failedLookupLocation, onlyRecordFailures, state);
+        if (resolvedByAddingExtension) {
+            return resolvedByAddingExtension;
         }
-        // Then try stripping a ".js" or ".jsx" extension and replacing it with a TypeScript one, e.g. "./foo.js" can be matched by "./foo.ts" or "./foo.d.ts"
+
+        // If that didn't work, try stripping a ".js" or ".jsx" extension and replacing it with a TypeScript one;
+        // e.g. "./foo.js" can be matched by "./foo.ts" or "./foo.d.ts"
         if (hasJavaScriptFileExtension(candidate)) {
             const extensionless = removeFileExtension(candidate);
             if (state.traceEnabled) {
                 const extension = candidate.substring(extensionless.length);
                 trace(state.host, Diagnostics.File_name_0_has_a_1_extension_stripping_it, candidate, extension);
             }
-            return loadModuleFromFileWorker(extensionless, extensions, failedLookupLocation, onlyRecordFailures, state);
+            return tryAddingExtensions(extensionless, extensions, failedLookupLocation, onlyRecordFailures, state);
         }
     }
 
-    function loadModuleFromFileWorker(candidate: string, extensions: string[], failedLookupLocation: string[], onlyRecordFailures: boolean, state: ModuleResolutionState): string {
+    /** Try to return an existing file that adds one of the `extensions` to `candidate`. */
+    function tryAddingExtensions(candidate: string, extensions: string[], failedLookupLocation: string[], onlyRecordFailures: boolean, state: ModuleResolutionState): string | undefined {
         if (!onlyRecordFailures) {
             // check if containing folder exists - if it doesn't then just record failures for all supported extensions without disk probing
             const directory = getDirectoryPath(candidate);
@@ -686,26 +713,24 @@ namespace ts {
                 onlyRecordFailures = !directoryProbablyExists(directory, state.host);
             }
         }
-        return forEach(extensions, tryLoad);
+        return forEach(extensions, ext =>
+            !(state.skipTsx && isJsxOrTsxExtension(ext)) && tryFile(candidate + ext, failedLookupLocation, onlyRecordFailures, state));
+    }
 
-        function tryLoad(ext: string): string {
-            if (state.skipTsx && isJsxOrTsxExtension(ext)) {
-                return undefined;
+    /** Return the file if it exists. */
+    function tryFile(fileName: string, failedLookupLocation: string[], onlyRecordFailures: boolean, state: ModuleResolutionState): string | undefined {
+        if (!onlyRecordFailures && state.host.fileExists(fileName)) {
+            if (state.traceEnabled) {
+                trace(state.host, Diagnostics.File_0_exist_use_it_as_a_name_resolution_result, fileName);
             }
-            const fileName = fileExtensionIs(candidate, ext) ? candidate : candidate + ext;
-            if (!onlyRecordFailures && state.host.fileExists(fileName)) {
-                if (state.traceEnabled) {
-                    trace(state.host, Diagnostics.File_0_exist_use_it_as_a_name_resolution_result, fileName);
-                }
-                return fileName;
+            return fileName;
+        }
+        else {
+            if (state.traceEnabled) {
+                trace(state.host, Diagnostics.File_0_does_not_exist, fileName);
             }
-            else {
-                if (state.traceEnabled) {
-                    trace(state.host, Diagnostics.File_0_does_not_exist, fileName);
-                }
-                failedLookupLocation.push(fileName);
-                return undefined;
-            }
+            failedLookupLocation.push(fileName);
+            return undefined;
         }
     }
 
@@ -718,7 +743,10 @@ namespace ts {
             }
             const typesFile = tryReadTypesSection(packageJsonPath, candidate, state);
             if (typesFile) {
-                const result = loadModuleFromFile(typesFile, extensions, failedLookupLocation, !directoryProbablyExists(getDirectoryPath(typesFile), state.host), state);
+                const onlyRecordFailures = !directoryProbablyExists(getDirectoryPath(typesFile), state.host);
+                // A package.json "typings" may specify an exact filename, or may choose to omit an extension.
+                const result = tryFile(typesFile, failedLookupLocation, onlyRecordFailures, state) ||
+                    tryAddingExtensions(typesFile, extensions, failedLookupLocation, onlyRecordFailures, state);
                 if (result) {
                     return result;
                 }
@@ -959,6 +987,7 @@ namespace ts {
             readFile: fileName => sys.readFile(fileName),
             trace: (s: string) => sys.write(s + newLine),
             directoryExists: directoryName => sys.directoryExists(directoryName),
+            getEnvironmentVariable: name => getEnvironmentVariable(name, /*host*/ undefined),
             getDirectories: (path: string) => sys.getDirectories(path),
             realpath
         };
@@ -1097,7 +1126,7 @@ namespace ts {
         // - This calls resolveModuleNames, and then calls findSourceFile for each resolved module.
         // As all these operations happen - and are nested - within the createProgram call, they close over the below variables.
         // The current resolution depth is tracked by incrementing/decrementing as the depth first search progresses.
-        const maxNodeModulesJsDepth = typeof options.maxNodeModuleJsDepth === "number" ? options.maxNodeModuleJsDepth : 2;
+        const maxNodeModulesJsDepth = typeof options.maxNodeModuleJsDepth === "number" ? options.maxNodeModuleJsDepth : 0;
         let currentNodeModulesDepth = 0;
 
         // If a module has some of its imports skipped due to being at the depth limit under node_modules, then track
@@ -1702,7 +1731,7 @@ namespace ts {
                     return false;
                 }
 
-                function checkModifiers(modifiers: ModifiersArray): boolean {
+                function checkModifiers(modifiers: NodeArray<Modifier>): boolean {
                     if (modifiers) {
                         for (const modifier of modifiers) {
                             switch (modifier.kind) {
@@ -1786,6 +1815,17 @@ namespace ts {
             let imports: LiteralExpression[];
             let moduleAugmentations: LiteralExpression[];
 
+            // If we are importing helpers, we need to add a synthetic reference to resolve the
+            // helpers library.
+            if (options.importHelpers
+                && (options.isolatedModules || isExternalModuleFile)
+                && !file.isDeclarationFile) {
+                const externalHelpersModuleReference = <StringLiteral>createNode(SyntaxKind.StringLiteral);
+                externalHelpersModuleReference.text = externalHelpersModuleNameText;
+                externalHelpersModuleReference.parent = file;
+                imports = [externalHelpersModuleReference];
+            }
+
             for (const node of file.statements) {
                 collectModuleReferences(node, /*inAmbientModule*/ false);
                 if (isJavaScriptFile) {
@@ -1819,7 +1859,7 @@ namespace ts {
                         }
                         break;
                     case SyntaxKind.ModuleDeclaration:
-                        if (isAmbientModule(<ModuleDeclaration>node) && (inAmbientModule || node.flags & NodeFlags.Ambient || isDeclarationFile(file))) {
+                        if (isAmbientModule(<ModuleDeclaration>node) && (inAmbientModule || hasModifier(node, ModifierFlags.Ambient) || isDeclarationFile(file))) {
                             const moduleName = <LiteralExpression>(<ModuleDeclaration>node).name;
                             // Ambient module declarations can be interpreted as augmentations for some existing external modules.
                             // This will happen in two cases:
@@ -2302,7 +2342,7 @@ namespace ts {
                 programDiagnostics.add(createCompilerDiagnostic(Diagnostics.Option_0_cannot_be_specified_without_specifying_option_1, "emitDecoratorMetadata", "experimentalDecorators"));
             }
 
-            if (options.reactNamespace && !isIdentifier(options.reactNamespace, languageVersion)) {
+            if (options.reactNamespace && !isIdentifierText(options.reactNamespace, languageVersion)) {
                 programDiagnostics.add(createCompilerDiagnostic(Diagnostics.Invalid_value_for_reactNamespace_0_is_not_a_valid_identifier, options.reactNamespace));
             }
 
